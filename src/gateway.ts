@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import crypto from 'node:crypto';
+import { waitForPostgres } from './db.js';
 import {
   createApiKey,
   validateApiKey,
@@ -8,12 +9,11 @@ import {
   getApiKey,
 } from './api-keys.js';
 
-
-
 const PORT = Number(process.env.PORT ?? 3000);
 
 const UPSTREAM_URL =
-  process.env.UPSTREAM_URL ?? 'http://127.0.0.1:4000'; 
+  process.env.UPSTREAM_URL ?? 'http://127.0.0.1:4000';
+
 const UPSTREAM_TIMEOUT_MS =
   Number(process.env.UPSTREAM_TIMEOUT_MS ?? 5000);
 
@@ -147,11 +147,32 @@ app.post('/admin/api-keys', async (request, reply) => {
     });
   }
 
-  const { plaintext, record } = createApiKey(
-    body.tenant_id,
-    body.name,
-    { env: body.env }
-  );
+  let created;
+  try {
+    created = await createApiKey(
+      body.tenant_id,
+      body.name,
+      { env: body.env }
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+
+    // Postgres foreign-key violation = tenant_id doesn't exist.
+    if (msg.includes('foreign key')) {
+      return reply.code(400).send({
+        error: 'unknown_tenant',
+        message: `Tenant '${body.tenant_id}' does not exist`,
+      });
+    }
+
+    request.log.error({ err: msg }, 'failed to create api key');
+    return reply.code(500).send({
+      error: 'internal_error',
+      message: 'Could not create API key',
+    });
+  }
+
+  const { plaintext, record } = created;
 
   request.log.info(
     {
@@ -188,7 +209,7 @@ app.get('/admin/api-keys', async (request) => {
 
   const query = request.query as { tenant_id?: string };
 
-  const keys = listApiKeys(query.tenant_id);
+  const keys = await listApiKeys(query.tenant_id);
 
   return {
     count: keys.length,
@@ -206,7 +227,7 @@ app.delete('/admin/api-keys/:id', async (request, reply) => {
 
   const { id } = request.params as { id: string };
 
-  const existing = getApiKey(id);
+  const existing = await getApiKey(id);
 
   if (!existing) {
     return reply.code(404).send({
@@ -215,7 +236,7 @@ app.delete('/admin/api-keys/:id', async (request, reply) => {
     });
   }
 
-  revokeApiKey(id);
+  await revokeApiKey(id);
 
   request.log.info(
     {
@@ -252,7 +273,7 @@ app.all('/*', async (request, reply) => {
     buildUpstreamUrl(path, query);
 
 
-    /*
+  /*
    * -----------------------------------------------------------------------
    * AUTHENTICATION
    *
@@ -311,7 +332,30 @@ app.all('/*', async (request, reply) => {
       });
   }
 
-  const apiKeyRecord = validateApiKey(plaintextKey);
+  let apiKeyRecord;
+  try {
+    apiKeyRecord = await validateApiKey(plaintextKey);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    request.log.error(
+      {
+        event: 'auth.db_error',
+        request_id: requestId,
+        route: path,
+        error: msg,
+      },
+      'database error during authentication'
+    );
+    return reply
+      .code(500)
+      .header('content-type', 'application/json')
+      .header('x-request-id', requestId)
+      .send({
+        error: 'internal_error',
+        message: 'Authentication check failed.',
+        request_id: requestId,
+      });
+  }
 
   if (!apiKeyRecord) {
     request.log.warn(
@@ -419,7 +463,7 @@ app.all('/*', async (request, reply) => {
   upstreamHeaders['x-metergate-request'] =
     'true';
 
-    /*
+  /*
    * Inject TRUSTED identity headers.
    *
    * These come from the validated API key record — NOT from the client.
@@ -445,7 +489,6 @@ app.all('/*', async (request, reply) => {
    * x-api-key-prefix: the display prefix, useful for upstream logs.
    */
   upstreamHeaders['x-api-key-prefix'] = apiKeyRecord.prefix;
-  
 
 
   /*
@@ -659,7 +702,13 @@ app.all('/*', async (request, reply) => {
 
 /*
  * Start gateway.
+ *
+ * We wait for Postgres to be reachable first. In Docker, the gateway
+ * and postgres containers start in parallel — this prevents a crash
+ * when Postgres isn't quite ready yet.
  */
+await waitForPostgres();
+
 app.listen({
   host: '0.0.0.0',
   port: PORT
@@ -668,7 +717,7 @@ app.listen({
 .then(() => {
 
   app.log.info(
-    `MeterGate listening on http://localhost:${PORT}`
+    `MeterGate listening on http://0.0.0.0:${PORT}`
   );
 
   app.log.info(

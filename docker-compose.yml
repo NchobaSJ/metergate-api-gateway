@@ -1,0 +1,96 @@
+# =============================================================================
+# MeterGate — Docker Compose
+# =============================================================================
+# Three services:
+#   - postgres  : the database
+#   - upstream  : the mock API
+#   - gateway   : MeterGate itself
+#
+# Only the gateway is exposed to the host (port 3000).
+# Postgres and upstream are reachable only inside the Docker network.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: metergate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Mount init.sql so Postgres runs it on first boot
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      # Expose to host for debugging with psql or a GUI.
+      # In production you would NOT publish this.
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - metergate_net
+
+  # ---------------------------------------------------------------------------
+  # upstream (mock API)
+  # ---------------------------------------------------------------------------
+  upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: metergate-upstream
+    restart: unless-stopped
+    command: ["node", "dist/mock-upstream.js"]
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+    expose:
+      - "4000"
+    # No ports: — only reachable from other containers.
+    networks:
+      - metergate_net
+
+  # ---------------------------------------------------------------------------
+  # gateway (MeterGate)
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: metergate-gateway
+    restart: unless-stopped
+    command: ["node", "dist/gateway.js"]
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      UPSTREAM_URL:      ${UPSTREAM_URL}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS}
+      # DATABASE_URL uses the service name `postgres` as the hostname.
+      # That's how containers find each other.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+    networks:
+      - metergate_net
+
+# =============================================================================
+networks:
+  metergate_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

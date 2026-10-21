@@ -4,7 +4,7 @@ const app = Fastify({
   logger: true
 });
 
-const PORT = 4000;
+const PORT = Number(process.env.PORT ?? 4000);
 
 
 /*
